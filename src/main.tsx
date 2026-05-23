@@ -4,18 +4,15 @@ import {
   Activity,
   Armchair,
   Bot,
-  Camera,
   Check,
   ChevronLeft,
   CircleStop,
-  Clipboard,
   Gauge,
   Gamepad2,
   Home,
   Joystick,
   Link,
   Plus,
-  Radio,
   RotateCcw,
   Satellite,
   Send,
@@ -23,8 +20,6 @@ import {
   SlidersHorizontal,
   Square,
   Unplug,
-  Video,
-  Wifi,
   Wrench,
   X,
   Zap,
@@ -97,12 +92,6 @@ function App() {
   const [serialState, setSerialState] = useState<LinkState>("offline");
   const [leaderSerialState, setLeaderSerialState] = useState<LinkState>("offline");
   const [followerSerialState, setFollowerSerialState] = useState<LinkState>("offline");
-  const [cameraState, setCameraState] = useState<LinkState>("offline");
-  const [webrtcState, setWebrtcState] = useState<LinkState>("offline");
-  const [wsState, setWsState] = useState<LinkState>("offline");
-  const [stream, setStream] = useState<MediaStream | null>(null);
-  const [room] = useState(makeRoom);
-  const [activeTab, setActiveTab] = useState<"nodes" | "control">("nodes");
   const [teleopMode, setTeleopMode] = useState<TeleopMode>("manual");
   const [activeArmId, setActiveArmId] = useState("leader-1");
   const [deadman, setDeadman] = useState(false);
@@ -119,7 +108,6 @@ function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [isPlayingMotion, setIsPlayingMotion] = useState(false);
   const [recordedFrames, setRecordedFrames] = useState<MotionFrame[]>([]);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
   const feetechRef = useRef(new FeetechService());
   const leaderFeetechRef = useRef(new FeetechService());
   const followerFeetechRef = useRef(new FeetechService());
@@ -143,14 +131,7 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
-    }
-  }, [stream, view]);
-
-  useEffect(() => {
     return () => {
-      stream?.getTracks().forEach((track) => track.stop());
       if (monitorRef.current) {
         window.clearInterval(monitorRef.current);
       }
@@ -164,9 +145,9 @@ function App() {
       void leaderFeetechRef.current.disconnect();
       void followerFeetechRef.current.disconnect();
     };
-  }, [stream]);
+  }, []);
 
-  const browserOk = "serial" in navigator && "mediaDevices" in navigator;
+  const browserOk = "serial" in navigator;
   const activeArm = arms.find((arm) => arm.id === activeArmId) ?? arms[0];
 
   const appendLog = (message: string) => {
@@ -504,44 +485,7 @@ function App() {
     }, 60);
   };
 
-  const startCamera = async () => {
-    setCameraState("connecting");
-    try {
-      const media = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "environment" },
-        audio: false,
-      });
-      setStream(media);
-      setCameraState("online");
-      appendLog("camera stream started");
-    } catch (error) {
-      setCameraState("offline");
-      appendLog(error instanceof Error ? error.message : "camera failed");
-    }
-  };
 
-  const stopCamera = () => {
-    stream?.getTracks().forEach((track) => track.stop());
-    setStream(null);
-    setCameraState("offline");
-    appendLog("camera stream stopped");
-  };
-
-  const startNetwork = () => {
-    setWebrtcState("connecting");
-    setWsState("connecting");
-    window.setTimeout(() => {
-      setWebrtcState("online");
-      setWsState("online");
-      appendLog(`room ${room} ready`);
-    }, 500);
-  };
-
-  const stopNetwork = () => {
-    setWebrtcState("offline");
-    setWsState("offline");
-    appendLog("network links closed");
-  };
 
   const updateJoint = (key: JointKey, value: number) => {
     setArms((items) =>
@@ -613,20 +557,12 @@ function App() {
     appendLog(`${nextArm.name} added`);
   };
 
-  const copyInvite = async () => {
-    const url = `${location.origin}${location.pathname}#${room}`;
-    await navigator.clipboard?.writeText(url);
-    appendLog("invite link copied");
-  };
 
   const statusItems = useMemo(
     () => [
       { label: "Serial", state: serialState, icon: Link },
-      { label: "WebRTC", state: webrtcState, icon: Radio },
-      { label: "Camera", state: cameraState, icon: Video },
-      { label: "WebSocket", state: wsState, icon: Wifi },
     ],
-    [serialState, webrtcState, cameraState, wsState],
+    [serialState],
   );
 
   return (
@@ -639,19 +575,14 @@ function App() {
       />
       {view === "home" && (
         <HomeView
-          onTeleop={() => {
-            setView("teleop");
-            startNetwork();
-          }}
+          onTeleop={() => setView("teleop")}
           onMotor={() => setView("motor")}
         />
       )}
       {view === "teleop" && (
         <TeleopView
-          room={room}
           arms={arms}
           activeArm={activeArm}
-          activeTab={activeTab}
           teleopMode={teleopMode}
           deadman={deadman}
           speed={speed}
@@ -670,20 +601,13 @@ function App() {
           isRecording={isRecording}
           isPlayingMotion={isPlayingMotion}
           recordedFrames={recordedFrames}
-          stream={stream}
-          videoRef={videoRef}
           setActiveArmId={setActiveArmId}
-          setActiveTab={setActiveTab}
           setTeleopMode={setTeleopMode}
           setDeadman={setDeadman}
           setSpeed={setSpeed}
           addArm={addArm}
-          copyInvite={copyInvite}
-          startCamera={startCamera}
-          stopCamera={stopCamera}
           connectSerial={connectSerial}
           disconnectSerial={disconnectSerial}
-          stopNetwork={stopNetwork}
           updateJoint={updateJoint}
           refreshMotors={() => refreshMotorSnapshots()}
           connectTeleopSerial={connectTeleopSerial}
@@ -742,7 +666,7 @@ function Header({
         </div>
         <div>
           <h1>{view === "teleop" ? "SO-101 テレオペレーション" : view === "motor" ? "モーターテスト" : "SO-101 Remote Control"}</h1>
-          <p>{view === "home" ? "WebRTC + Web Serial API による遠隔テレオペレーションシステム" : "低遅延映像とジョイント制御の操作コンソール"}</p>
+          <p>{view === "home" ? "Web Serial API による遠隔ジョイント制御システム" : "遠隔ジョイント制御の操作コンソール"}</p>
         </div>
       </div>
       <div className="header-actions">
@@ -781,7 +705,7 @@ function HomeView({ onTeleop, onMotor }: { onTeleop: () => void; onMotor: () => 
           <Joystick size={28} />
         </div>
         <h2>テレオペレーション</h2>
-        <p>複数のアームとカメラをWebRTC経由で接続し、リアルタイムで遠隔制御。協調作業用のルームとノード管理を備えています。</p>
+        <p>Web Serial API経由でロボットアームをPCに直接接続し、リアルタイムで関節制御・追従動作やモーション再生を行えます。</p>
         <button className="primary-action" onClick={onTeleop}>
           <Bot size={18} />
           テレオペレーションを開始
@@ -803,10 +727,8 @@ function HomeView({ onTeleop, onMotor }: { onTeleop: () => void; onMotor: () => 
 }
 
 function TeleopView(props: {
-  room: string;
   arms: Arm[];
   activeArm: Arm;
-  activeTab: "nodes" | "control";
   teleopMode: TeleopMode;
   deadman: boolean;
   speed: number;
@@ -825,20 +747,13 @@ function TeleopView(props: {
   isRecording: boolean;
   isPlayingMotion: boolean;
   recordedFrames: MotionFrame[];
-  stream: MediaStream | null;
-  videoRef: React.RefObject<HTMLVideoElement | null>;
   setActiveArmId: (id: string) => void;
-  setActiveTab: (tab: "nodes" | "control") => void;
   setTeleopMode: (mode: TeleopMode) => void;
   setDeadman: (value: boolean) => void;
   setSpeed: (value: number) => void;
   addArm: (role: ArmRole) => void;
-  copyInvite: () => void;
-  startCamera: () => void;
-  stopCamera: () => void;
   connectSerial: () => void;
   disconnectSerial: () => void;
-  stopNetwork: () => void;
   updateJoint: (key: JointKey, value: number) => void;
   refreshMotors: () => void;
   connectTeleopSerial: (role: "leader" | "follower") => void;
@@ -856,138 +771,68 @@ function TeleopView(props: {
   enableTorque: () => void;
   emergencyStop: () => void;
 }) {
-  const participants = 1 + props.arms.filter((arm) => arm.state === "online").length;
-
   return (
     <main className="workspace">
-      <section className="room-bar">
-        <div>
-          <span>ルーム</span>
-          <code>{props.room}</code>
-        </div>
-        <button className="icon-button" title="招待リンクをコピー" onClick={props.copyInvite}>
-          <Clipboard size={16} />
-        </button>
-        <div>
-          <span>状態</span>
-          <strong>アクティブ</strong>
-        </div>
-        <div>
-          <span>参加者</span>
-          <strong>{participants}</strong>
-        </div>
-        <button className="icon-text danger ghost" onClick={props.stopNetwork}>
-          <CircleStop size={16} />
-          切断
-        </button>
-      </section>
-
-      <div className="teleop-layout">
-        <section className="stage">
-          <div className="stage-toolbar">
-            <button className="icon-text" onClick={props.stream ? props.stopCamera : props.startCamera}>
-              <Camera size={17} />
-              {props.stream ? "カメラ停止" : "カメラ追加"}
-            </button>
-            <button className="icon-text" onClick={props.connectSerial}>
-              <Satellite size={17} />
-              Serial接続
-            </button>
-            <button className="icon-text subtle" onClick={props.disconnectSerial}>
-              <Unplug size={17} />
-              Serial切断
-            </button>
+      <div className="teleop-layout" style={{ marginTop: "0" }}>
+        <section className="connection-column">
+          <div className="panel-header">
+            <h2>アーム接続状況</h2>
           </div>
-          <div className="video-wall">
-            {props.stream ? (
-              <video ref={props.videoRef} autoPlay playsInline muted />
-            ) : (
-              <div className="empty-camera">
-                <Video size={56} />
-                <h3>カメラを追加してください</h3>
-                <p>上部のボタンでライブ映像を開始できます</p>
-                <button className="chip-action" onClick={props.startCamera}>
-                  <Plus size={15} />
-                  カメラ追加
-                </button>
-              </div>
-            )}
-          </div>
-          <div className="command-rail">
-            <button className="command-button" onClick={props.writeHomePose}>
-              <Home size={18} />
-              Home
-            </button>
-            <button className="command-button" onClick={props.writeReadyPose}>
-              <Zap size={18} />
-              Ready
-            </button>
-            <button className="command-button danger" onClick={props.emergencyStop}>
-              <Square size={18} />
-              Stop
-            </button>
-          </div>
+          <TeleopStatusPanel
+            serialState={props.serialState}
+            leaderSerialState={props.leaderSerialState}
+            followerSerialState={props.followerSerialState}
+            motors={props.motors}
+            discoveredMotorIds={props.discoveredMotorIds}
+            leaderMotors={props.leaderMotors}
+            followerMotors={props.followerMotors}
+            leaderMotorIds={props.leaderMotorIds}
+            followerMotorIds={props.followerMotorIds}
+            connectSerial={props.connectSerial}
+            connectTeleopSerial={props.connectTeleopSerial}
+            disconnectTeleopSerial={props.disconnectTeleopSerial}
+            refreshMotors={props.refreshMotors}
+            refreshTeleopPair={props.refreshTeleopPair}
+          />
         </section>
 
-        <aside className="control-panel">
-          <div className="tabs">
-            <button className={props.activeTab === "nodes" ? "active" : ""} onClick={() => props.setActiveTab("nodes")}>
-              接続
-            </button>
-            <button className={props.activeTab === "control" ? "active" : ""} onClick={() => props.setActiveTab("control")}>
-              操作
-            </button>
+        <section className="control-column">
+          <div className="panel-header">
+            <h2>操作コンソール</h2>
           </div>
-
-          {props.activeTab === "nodes" ? (
-            <TeleopStatusPanel
-              serialState={props.serialState}
-              leaderSerialState={props.leaderSerialState}
-              followerSerialState={props.followerSerialState}
-              motors={props.motors}
-              discoveredMotorIds={props.discoveredMotorIds}
-              leaderMotors={props.leaderMotors}
-              followerMotors={props.followerMotors}
-              leaderMotorIds={props.leaderMotorIds}
-              followerMotorIds={props.followerMotorIds}
-              connectSerial={props.connectSerial}
-              connectTeleopSerial={props.connectTeleopSerial}
-              disconnectTeleopSerial={props.disconnectTeleopSerial}
-              refreshMotors={props.refreshMotors}
-              refreshTeleopPair={props.refreshTeleopPair}
-            />
-          ) : (
-            <TeleopControls
-              activeArm={props.activeArm}
-              teleopMode={props.teleopMode}
-              deadman={props.deadman}
-              speed={props.speed}
-              motors={props.motors}
-              discoveredMotorIds={props.discoveredMotorIds}
-              leaderMotorIds={props.leaderMotorIds}
-              followerMotorIds={props.followerMotorIds}
-              isFollowing={props.isFollowing}
-              isRecording={props.isRecording}
-              isPlayingMotion={props.isPlayingMotion}
-              recordedFrames={props.recordedFrames}
-              setTeleopMode={props.setTeleopMode}
-              setDeadman={(enabled) => {
-                props.setDeadman(enabled);
-                void (enabled ? props.enableTorque() : props.emergencyStop());
-              }}
-              setSpeed={props.setSpeed}
-              updateJoint={props.updateJoint}
-              refreshMotors={props.refreshMotors}
-              startFollow={props.startFollow}
-              stopFollow={props.stopFollow}
-              startRecording={props.startRecording}
-              stopRecording={props.stopRecording}
-              clearRecording={props.clearRecording}
-              playRecording={props.playRecording}
-              stopPlayback={props.stopPlayback}
-            />
-          )}
-        </aside>
+          <TeleopControls
+            activeArm={props.activeArm}
+            teleopMode={props.teleopMode}
+            deadman={props.deadman}
+            speed={props.speed}
+            motors={props.motors}
+            discoveredMotorIds={props.discoveredMotorIds}
+            leaderMotorIds={props.leaderMotorIds}
+            followerMotorIds={props.followerMotorIds}
+            isFollowing={props.isFollowing}
+            isRecording={props.isRecording}
+            isPlayingMotion={props.isPlayingMotion}
+            recordedFrames={props.recordedFrames}
+            setTeleopMode={props.setTeleopMode}
+            setDeadman={(enabled) => {
+              props.setDeadman(enabled);
+              void (enabled ? props.enableTorque() : props.emergencyStop());
+            }}
+            setSpeed={props.setSpeed}
+            updateJoint={props.updateJoint}
+            refreshMotors={props.refreshMotors}
+            startFollow={props.startFollow}
+            stopFollow={props.stopFollow}
+            startRecording={props.startRecording}
+            stopRecording={props.stopRecording}
+            clearRecording={props.clearRecording}
+            playRecording={props.playRecording}
+            stopPlayback={props.stopPlayback}
+            writeHomePose={props.writeHomePose}
+            writeReadyPose={props.writeReadyPose}
+            emergencyStop={props.emergencyStop}
+          />
+        </section>
       </div>
 
       <section className="log-dock">
@@ -1185,6 +1030,9 @@ function TeleopControls({
   clearRecording,
   playRecording,
   stopPlayback,
+  writeHomePose,
+  writeReadyPose,
+  emergencyStop,
 }: {
   activeArm: Arm;
   teleopMode: TeleopMode;
@@ -1210,6 +1058,9 @@ function TeleopControls({
   clearRecording: () => void;
   playRecording: () => void;
   stopPlayback: () => void;
+  writeHomePose: () => void;
+  writeReadyPose: () => void;
+  emergencyStop: () => void;
 }) {
   const sharedIds = leaderMotorIds.filter((id) => followerMotorIds.includes(id));
   const motionDuration = recordedFrames.length > 0 ? recordedFrames[recordedFrames.length - 1].time : 0;
@@ -1220,6 +1071,21 @@ function TeleopControls({
 
   return (
     <div className="panel-body">
+      <div className="command-rail compact" style={{ marginBottom: "18px", marginTop: "0" }}>
+        <button className="command-button" onClick={writeHomePose}>
+          <Home size={18} />
+          Home
+        </button>
+        <button className="command-button" onClick={writeReadyPose}>
+          <Zap size={18} />
+          Ready
+        </button>
+        <button className="command-button danger" onClick={emergencyStop}>
+          <Square size={18} />
+          Stop
+        </button>
+      </div>
+
       <div className="mode-switch">
         <button className={teleopMode === "manual" ? "active" : ""} onClick={() => setTeleopMode("manual")}>
           手動
