@@ -68,6 +68,14 @@ const makeRoom = () => `room-${Math.random().toString(36).slice(2, 9)}`;
 const motorIdByJoint = new Map(jointMeta.map((joint) => [joint.key, joint.motorId]));
 const jointKeyByMotorId = new Map(jointMeta.map((joint) => [joint.motorId, joint.key]));
 
+// Median of up to three samples. Used to reject single-sample read glitches
+// (which otherwise get baked into the recording and make the follower jerk
+// toward an extreme during playback) while preserving genuine ramps.
+function median(values: number[]) {
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
 function normalizeRecordedFrames(frames: MotionFrame[], targetIds: MotorId[]) {
   const lastKnown = new Map<MotorId, number>();
 
@@ -117,6 +125,8 @@ function App() {
   const recordingStartedAtRef = useRef(0);
   const recordedFramesRef = useRef<MotionFrame[]>([]);
   const lastRecordedPositionsRef = useRef<Map<MotorId, number>>(new Map());
+  const rawReadHistoryRef = useRef<Map<MotorId, number[]>>(new Map());
+  const recordingActiveRef = useRef(false);
   const playbackCancelledRef = useRef(false);
 
   const [arms, setArms] = useState<Arm[]>([
@@ -138,8 +148,9 @@ function App() {
       if (followLoopRef.current) {
         window.clearInterval(followLoopRef.current);
       }
+      recordingActiveRef.current = false;
       if (recordingLoopRef.current) {
-        window.clearInterval(recordingLoopRef.current);
+        window.clearTimeout(recordingLoopRef.current);
       }
       void feetechRef.current.disconnect();
       void leaderFeetechRef.current.disconnect();
@@ -319,51 +330,87 @@ function App() {
     appendLog("follow stopped");
   };
 
+  // Minimum interval between recorded frames (ms). The loop is self-paced:
+  // it waits for each read cycle to finish before scheduling the next one,
+  // so reads never overlap on the shared serial port.
+  const RECORD_INTERVAL_MS = 30;
+
   const startRecording = () => {
     if (!leaderFeetechRef.current.connected || leaderMotorIds.length === 0) {
       appendLog("leader must be connected before recording");
       return;
     }
-    if (recordingLoopRef.current) window.clearInterval(recordingLoopRef.current);
+    if (recordingActiveRef.current) return;
+    if (recordingLoopRef.current) {
+      window.clearTimeout(recordingLoopRef.current);
+      recordingLoopRef.current = null;
+    }
     recordedFramesRef.current = [];
     lastRecordedPositionsRef.current = new Map();
+    rawReadHistoryRef.current = new Map();
     setRecordedFrames([]);
     recordingStartedAtRef.current = performance.now();
+    recordingActiveRef.current = true;
     setIsRecording(true);
     appendLog("motion recording started");
 
-    recordingLoopRef.current = window.setInterval(() => {
-      void (async () => {
-        const frame: MotionFrame = { time: Math.round(performance.now() - recordingStartedAtRef.current), positions: {} };
-        let validCount = 0;
+    const captureFrame = async () => {
+      if (!recordingActiveRef.current) return;
+      const cycleStart = performance.now();
+      const frame: MotionFrame = { time: Math.round(cycleStart - recordingStartedAtRef.current), positions: {} };
+      let validCount = 0;
 
-        for (const id of leaderMotorIds) {
-          try {
-            const position = await leaderFeetechRef.current.readPosition(id);
-            frame.positions[id] = position;
-            lastRecordedPositionsRef.current.set(id, position);
-            validCount += 1;
-          } catch (error) {
-            const previous = lastRecordedPositionsRef.current.get(id);
-            if (previous !== undefined) {
-              frame.positions[id] = previous;
-            } else {
-              appendLog(`record ID ${id} skipped: ${error instanceof Error ? error.message : String(error)}`);
-            }
-          }
+      for (const id of leaderMotorIds) {
+        let raw: number | null = null;
+        try {
+          const position = await leaderFeetechRef.current.readPosition(id);
+          // Reject obviously-invalid samples (out of the 12-bit range) outright.
+          if (Number.isFinite(position) && position >= 0 && position <= 4095) raw = position;
+        } catch (error) {
+          appendLog(`record ID ${id} skipped: ${error instanceof Error ? error.message : String(error)}`);
         }
 
-        if (validCount > 0 || Object.keys(frame.positions).length === leaderMotorIds.length) {
-          recordedFramesRef.current = [...recordedFramesRef.current, frame];
-          setRecordedFrames(recordedFramesRef.current);
+        const history = rawReadHistoryRef.current.get(id) ?? [];
+        if (raw !== null) {
+          history.push(raw);
+          if (history.length > 3) history.shift();
+          rawReadHistoryRef.current.set(id, history);
         }
-      })();
-    }, 60);
+
+        // Use a median-of-3 once enough samples exist so a single spike never
+        // lands in the timeline; fall back to latest / last-known before that.
+        let value: number | undefined;
+        if (history.length >= 3) value = median(history);
+        else if (history.length > 0) value = history[history.length - 1];
+        else value = lastRecordedPositionsRef.current.get(id);
+
+        if (value !== undefined) {
+          frame.positions[id] = value;
+          lastRecordedPositionsRef.current.set(id, value);
+          if (raw !== null) validCount += 1;
+        }
+      }
+
+      // Recording may have been stopped while the reads were in flight.
+      if (!recordingActiveRef.current) return;
+
+      if (validCount > 0) {
+        recordedFramesRef.current = [...recordedFramesRef.current, frame];
+        setRecordedFrames(recordedFramesRef.current);
+      }
+
+      const elapsed = performance.now() - cycleStart;
+      const wait = Math.max(0, RECORD_INTERVAL_MS - elapsed);
+      recordingLoopRef.current = window.setTimeout(() => void captureFrame(), wait);
+    };
+
+    void captureFrame();
   };
 
   const stopRecording = () => {
+    recordingActiveRef.current = false;
     if (recordingLoopRef.current) {
-      window.clearInterval(recordingLoopRef.current);
+      window.clearTimeout(recordingLoopRef.current);
       recordingLoopRef.current = null;
     }
     setIsRecording(false);
@@ -372,11 +419,13 @@ function App() {
   };
 
   const clearRecording = () => {
+    recordingActiveRef.current = false;
     if (recordingLoopRef.current) {
-      window.clearInterval(recordingLoopRef.current);
+      window.clearTimeout(recordingLoopRef.current);
       recordingLoopRef.current = null;
     }
     recordedFramesRef.current = [];
+    rawReadHistoryRef.current = new Map();
     setRecordedFrames([]);
     setIsRecording(false);
     appendLog("motion recording cleared");
@@ -417,12 +466,16 @@ function App() {
 
     try {
       await followerFeetechRef.current.setAllTorque([...idsInMotion], true);
-      let previousTime = 0;
+      // Schedule against an absolute wall clock anchored at frame 0 so a slow
+      // write never accumulates drift: each frame is played at its recorded
+      // offset, and we skip the wait (not the write) if we are already behind.
+      const playbackStart = performance.now();
+      const firstOffset = frames[0].time;
       for (const frame of frames) {
         if (playbackCancelledRef.current) break;
-        const wait = Math.max(0, frame.time - previousTime);
-        previousTime = frame.time;
-        await new Promise((resolve) => window.setTimeout(resolve, wait));
+        const targetTime = playbackStart + (frame.time - firstOffset);
+        const wait = targetTime - performance.now();
+        if (wait > 0) await new Promise((resolve) => window.setTimeout(resolve, wait));
         const positions = new Map<MotorId, number>();
         Object.entries(frame.positions).forEach(([id, position]) => {
           const motorId = Number(id) as MotorId;
