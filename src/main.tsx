@@ -472,6 +472,54 @@ function App() {
     appendLog("motion recording cleared");
   };
 
+  const exportRecording = () => {
+    const frames = recordedFramesRef.current;
+    if (frames.length === 0) {
+      appendLog("no recorded motion to export");
+      return;
+    }
+    const involvedIds = Array.from(new Set([...leaderMotorIds, ...followerMotorIds])).sort((a, b) => a - b) as MotorId[];
+    const motorNames: Partial<Record<MotorId, string>> = {};
+    const motorLimits: Partial<Record<MotorId, { min: number; max: number; home: number }>> = {};
+    involvedIds.forEach((id) => {
+      motorNames[id] = MOTOR_NAMES[id];
+      motorLimits[id] = MOTOR_LIMITS[id];
+    });
+
+    const payload = {
+      version: 1,
+      app: "so101-teleoperation-console",
+      createdAt: new Date().toISOString(),
+      durationMs: frames.length > 0 ? frames[frames.length - 1].time : 0,
+      frameCount: frames.length,
+      leader: {
+        role: "leader",
+        motorIds: leaderMotorIds,
+        connection: leaderFeetechRef.current.getConnectionInfo(),
+      },
+      follower: {
+        role: "follower",
+        motorIds: followerMotorIds,
+        connection: followerFeetechRef.current.getConnectionInfo(),
+      },
+      motorNames,
+      motorLimits,
+      frames,
+    };
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `so101-motion-${stamp}.json`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+    appendLog(`exported ${frames.length} frames to ${anchor.download}`);
+  };
+
   const stopPlayback = async () => {
     playbackCancelledRef.current = true;
     setIsPlayingMotion(false);
@@ -702,6 +750,7 @@ function App() {
           startRecording={startRecording}
           stopRecording={stopRecording}
           clearRecording={clearRecording}
+          exportRecording={exportRecording}
           playRecording={playRecording}
           stopPlayback={stopPlayback}
           writeHomePose={writeHomePose}
@@ -848,6 +897,7 @@ function TeleopView(props: {
   startRecording: () => void;
   stopRecording: () => void;
   clearRecording: () => void;
+  exportRecording: () => void;
   playRecording: () => void;
   stopPlayback: () => void;
   writeHomePose: () => void;
@@ -910,6 +960,7 @@ function TeleopView(props: {
             startRecording={props.startRecording}
             stopRecording={props.stopRecording}
             clearRecording={props.clearRecording}
+            exportRecording={props.exportRecording}
             playRecording={props.playRecording}
             stopPlayback={props.stopPlayback}
             writeHomePose={props.writeHomePose}
@@ -1112,6 +1163,7 @@ function TeleopControls({
   startRecording,
   stopRecording,
   clearRecording,
+  exportRecording,
   playRecording,
   stopPlayback,
   writeHomePose,
@@ -1140,6 +1192,7 @@ function TeleopControls({
   startRecording: () => void;
   stopRecording: () => void;
   clearRecording: () => void;
+  exportRecording: () => void;
   playRecording: () => void;
   stopPlayback: () => void;
   writeHomePose: () => void;
@@ -1302,6 +1355,10 @@ function TeleopControls({
               <button className="test-button danger" disabled={!isPlayingMotion} onClick={stopPlayback}>
                 <Square size={17} />
                 再生停止
+              </button>
+              <button className="test-button" disabled={isRecording || recordedFrames.length === 0} onClick={exportRecording}>
+                <Send size={17} />
+                書き出し
               </button>
               <button className="chip-action danger-lite" disabled={isRecording || isPlayingMotion || recordedFrames.length === 0} onClick={clearRecording}>
                 クリア

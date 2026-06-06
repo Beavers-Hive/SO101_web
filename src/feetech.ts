@@ -113,6 +113,16 @@ class SerialPortHandler {
     this.reader = this.port.readable.getReader();
   }
 
+  getPortInfo() {
+    if (!this.port) return null;
+    const info = this.port.getInfo();
+    return {
+      usbVendorId: info.usbVendorId ?? null,
+      usbProductId: info.usbProductId ?? null,
+      baudRate: this.baudRate,
+    };
+  }
+
   async write(bytes: number[]) {
     if (!this.isOpen || !this.writer) return 0;
     await this.writer.write(new Uint8Array(bytes));
@@ -290,6 +300,10 @@ export class FeetechService {
 
   get connected() {
     return Boolean(this.portHandler?.isOpen);
+  }
+
+  getConnectionInfo() {
+    return this.portHandler?.getPortInfo() ?? null;
   }
 
   async connect() {
