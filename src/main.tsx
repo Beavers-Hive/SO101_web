@@ -120,13 +120,18 @@ function App() {
   const leaderFeetechRef = useRef(new FeetechService());
   const followerFeetechRef = useRef(new FeetechService());
   const monitorRef = useRef<number | null>(null);
-  const followLoopRef = useRef<number | null>(null);
-  const recordingLoopRef = useRef<number | null>(null);
+  // A single self-paced loop drives both follow and record so the leader is
+  // read once per cycle and shared, instead of two loops fighting over the
+  // serial port (which made follow stutter while recording).
+  const leaderLoopRef = useRef<number | null>(null);
   const recordingStartedAtRef = useRef(0);
   const recordedFramesRef = useRef<MotionFrame[]>([]);
   const lastRecordedPositionsRef = useRef<Map<MotorId, number>>(new Map());
   const rawReadHistoryRef = useRef<Map<MotorId, number[]>>(new Map());
   const recordingActiveRef = useRef(false);
+  const isFollowingRef = useRef(false);
+  const followSharedIdsRef = useRef<MotorId[]>([]);
+  const leaderMotorIdsRef = useRef<MotorId[]>([]);
   const playbackCancelledRef = useRef(false);
 
   const [arms, setArms] = useState<Arm[]>([
@@ -141,16 +146,18 @@ function App() {
   ]);
 
   useEffect(() => {
+    leaderMotorIdsRef.current = leaderMotorIds;
+  }, [leaderMotorIds]);
+
+  useEffect(() => {
     return () => {
       if (monitorRef.current) {
         window.clearInterval(monitorRef.current);
       }
-      if (followLoopRef.current) {
-        window.clearInterval(followLoopRef.current);
-      }
       recordingActiveRef.current = false;
-      if (recordingLoopRef.current) {
-        window.clearTimeout(recordingLoopRef.current);
+      isFollowingRef.current = false;
+      if (leaderLoopRef.current) {
+        window.clearTimeout(leaderLoopRef.current);
       }
       void feetechRef.current.disconnect();
       void leaderFeetechRef.current.disconnect();
@@ -317,10 +324,8 @@ function App() {
   };
 
   const stopFollow = async () => {
-    if (followLoopRef.current) {
-      window.clearInterval(followLoopRef.current);
-      followLoopRef.current = null;
-    }
+    isFollowingRef.current = false;
+    followSharedIdsRef.current = [];
     setIsFollowing(false);
     try {
       await followerFeetechRef.current.setAllTorque(followerMotorIds, false);
@@ -330,10 +335,109 @@ function App() {
     appendLog("follow stopped");
   };
 
-  // Minimum interval between recorded frames (ms). The loop is self-paced:
-  // it waits for each read cycle to finish before scheduling the next one,
-  // so reads never overlap on the shared serial port.
-  const RECORD_INTERVAL_MS = 30;
+  // Target cycle time for the shared leader loop (ms). The loop is self-paced:
+  // it waits for each cycle to finish before scheduling the next, so reads
+  // never overlap on the serial port.
+  const LEADER_LOOP_INTERVAL_MS = 20;
+
+  // Despike a single cycle of leader reads and append one recorded frame.
+  const recordLeaderFrame = (rawPositions: Map<MotorId, number>, cycleStart: number) => {
+    const frame: MotionFrame = { time: Math.round(cycleStart - recordingStartedAtRef.current), positions: {} };
+    let validCount = 0;
+
+    for (const id of leaderMotorIdsRef.current) {
+      const raw = rawPositions.get(id);
+      const history = rawReadHistoryRef.current.get(id) ?? [];
+      if (raw !== undefined) {
+        history.push(raw);
+        if (history.length > 3) history.shift();
+        rawReadHistoryRef.current.set(id, history);
+      }
+
+      // Median-of-3 once enough samples exist so a single spike never lands in
+      // the timeline; fall back to latest / last-known before that.
+      let value: number | undefined;
+      if (history.length >= 3) value = median(history);
+      else if (history.length > 0) value = history[history.length - 1];
+      else value = lastRecordedPositionsRef.current.get(id);
+
+      if (value !== undefined) {
+        frame.positions[id] = value;
+        lastRecordedPositionsRef.current.set(id, value);
+        if (raw !== undefined) validCount += 1;
+      }
+    }
+
+    if (validCount > 0) {
+      recordedFramesRef.current = [...recordedFramesRef.current, frame];
+      setRecordedFrames(recordedFramesRef.current);
+    }
+  };
+
+  // Single loop that reads the leader once per cycle and feeds both the
+  // follower (live follow) and the recorder, so they never contend for the bus.
+  const ensureLeaderLoop = () => {
+    if (leaderLoopRef.current !== null) return;
+
+    const tick = async () => {
+      if (!recordingActiveRef.current && !isFollowingRef.current) {
+        leaderLoopRef.current = null;
+        return;
+      }
+      const cycleStart = performance.now();
+      const readIds = recordingActiveRef.current ? leaderMotorIdsRef.current : followSharedIdsRef.current;
+      const rawPositions = new Map<MotorId, number>();
+
+      for (const id of readIds) {
+        try {
+          const position = await leaderFeetechRef.current.readPosition(id);
+          if (Number.isFinite(position) && position >= 0 && position <= 4095) rawPositions.set(id, position);
+        } catch {
+          // A dropped sample is fine: record falls back, follow keeps last goal.
+        }
+      }
+
+      if (isFollowingRef.current) {
+        const writeMap = new Map<MotorId, number>();
+        followSharedIdsRef.current.forEach((id) => {
+          const position = rawPositions.get(id);
+          if (position !== undefined) writeMap.set(id, position);
+        });
+        if (writeMap.size > 0) {
+          try {
+            await followerFeetechRef.current.writePositions(writeMap);
+          } catch (error) {
+            appendLog(`follow error: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          const apply = (items: Map<MotorId, MotorSnapshot>) => {
+            const next = new Map(items);
+            writeMap.forEach((position, id) => {
+              const existing = next.get(id);
+              next.set(id, { id, name: MOTOR_NAMES[id], position, voltage: existing?.voltage ?? null, firmwareVersion: existing?.firmwareVersion ?? null });
+            });
+            return next;
+          };
+          setLeaderMotors(apply);
+          setFollowerMotors(apply);
+        }
+      }
+
+      if (recordingActiveRef.current) {
+        recordLeaderFrame(rawPositions, cycleStart);
+      }
+
+      if (!recordingActiveRef.current && !isFollowingRef.current) {
+        leaderLoopRef.current = null;
+        return;
+      }
+      const wait = Math.max(0, LEADER_LOOP_INTERVAL_MS - (performance.now() - cycleStart));
+      leaderLoopRef.current = window.setTimeout(() => void tick(), wait);
+    };
+
+    // Mark the loop as running before the first await so concurrent callers
+    // (e.g. starting record while already following) don't spawn a second one.
+    leaderLoopRef.current = window.setTimeout(() => void tick(), 0);
+  };
 
   const startRecording = () => {
     if (!leaderFeetechRef.current.connected || leaderMotorIds.length === 0) {
@@ -341,10 +445,6 @@ function App() {
       return;
     }
     if (recordingActiveRef.current) return;
-    if (recordingLoopRef.current) {
-      window.clearTimeout(recordingLoopRef.current);
-      recordingLoopRef.current = null;
-    }
     recordedFramesRef.current = [];
     lastRecordedPositionsRef.current = new Map();
     rawReadHistoryRef.current = new Map();
@@ -353,66 +453,11 @@ function App() {
     recordingActiveRef.current = true;
     setIsRecording(true);
     appendLog("motion recording started");
-
-    const captureFrame = async () => {
-      if (!recordingActiveRef.current) return;
-      const cycleStart = performance.now();
-      const frame: MotionFrame = { time: Math.round(cycleStart - recordingStartedAtRef.current), positions: {} };
-      let validCount = 0;
-
-      for (const id of leaderMotorIds) {
-        let raw: number | null = null;
-        try {
-          const position = await leaderFeetechRef.current.readPosition(id);
-          // Reject obviously-invalid samples (out of the 12-bit range) outright.
-          if (Number.isFinite(position) && position >= 0 && position <= 4095) raw = position;
-        } catch (error) {
-          appendLog(`record ID ${id} skipped: ${error instanceof Error ? error.message : String(error)}`);
-        }
-
-        const history = rawReadHistoryRef.current.get(id) ?? [];
-        if (raw !== null) {
-          history.push(raw);
-          if (history.length > 3) history.shift();
-          rawReadHistoryRef.current.set(id, history);
-        }
-
-        // Use a median-of-3 once enough samples exist so a single spike never
-        // lands in the timeline; fall back to latest / last-known before that.
-        let value: number | undefined;
-        if (history.length >= 3) value = median(history);
-        else if (history.length > 0) value = history[history.length - 1];
-        else value = lastRecordedPositionsRef.current.get(id);
-
-        if (value !== undefined) {
-          frame.positions[id] = value;
-          lastRecordedPositionsRef.current.set(id, value);
-          if (raw !== null) validCount += 1;
-        }
-      }
-
-      // Recording may have been stopped while the reads were in flight.
-      if (!recordingActiveRef.current) return;
-
-      if (validCount > 0) {
-        recordedFramesRef.current = [...recordedFramesRef.current, frame];
-        setRecordedFrames(recordedFramesRef.current);
-      }
-
-      const elapsed = performance.now() - cycleStart;
-      const wait = Math.max(0, RECORD_INTERVAL_MS - elapsed);
-      recordingLoopRef.current = window.setTimeout(() => void captureFrame(), wait);
-    };
-
-    void captureFrame();
+    ensureLeaderLoop();
   };
 
   const stopRecording = () => {
     recordingActiveRef.current = false;
-    if (recordingLoopRef.current) {
-      window.clearTimeout(recordingLoopRef.current);
-      recordingLoopRef.current = null;
-    }
     setIsRecording(false);
     setRecordedFrames(recordedFramesRef.current);
     appendLog(`motion recording stopped: ${recordedFramesRef.current.length} frames`);
@@ -420,10 +465,6 @@ function App() {
 
   const clearRecording = () => {
     recordingActiveRef.current = false;
-    if (recordingLoopRef.current) {
-      window.clearTimeout(recordingLoopRef.current);
-      recordingLoopRef.current = null;
-    }
     recordedFramesRef.current = [];
     rawReadHistoryRef.current = new Map();
     setRecordedFrames([]);
@@ -452,6 +493,24 @@ function App() {
       appendLog("no recorded motion to play");
       return;
     }
+
+    // Playback must own the follower bus exclusively. If we are still
+    // following/recording, the shared leader loop would keep writing the
+    // leader's current (rest) position to the follower and fight the playback,
+    // dragging it back toward origin. Stop that loop first.
+    if (isFollowingRef.current || recordingActiveRef.current) {
+      isFollowingRef.current = false;
+      recordingActiveRef.current = false;
+      followSharedIdsRef.current = [];
+      setIsFollowing(false);
+      setIsRecording(false);
+      if (leaderLoopRef.current !== null) {
+        window.clearTimeout(leaderLoopRef.current);
+        leaderLoopRef.current = null;
+      }
+      appendLog("follow/record stopped for playback");
+    }
+
     playbackCancelledRef.current = false;
     setIsPlayingMotion(true);
     appendLog(`motion playback started: ${frames.length} frames`);
@@ -502,40 +561,12 @@ function App() {
       return;
     }
 
-    if (followLoopRef.current) window.clearInterval(followLoopRef.current);
     await followerFeetechRef.current.setAllTorque(sharedIds, true);
+    followSharedIdsRef.current = sharedIds;
+    isFollowingRef.current = true;
     setIsFollowing(true);
     appendLog(`follow started for IDs ${sharedIds.join(", ")}`);
-
-    followLoopRef.current = window.setInterval(() => {
-      void (async () => {
-        try {
-          const positions = new Map<MotorId, number>();
-          for (const id of sharedIds) {
-            positions.set(id, await leaderFeetechRef.current.readPosition(id));
-          }
-          await followerFeetechRef.current.writePositions(positions);
-          setLeaderMotors((items) => {
-            const next = new Map(items);
-            positions.forEach((position, id) => {
-              const existing = next.get(id);
-              next.set(id, { id, name: MOTOR_NAMES[id], position, voltage: existing?.voltage ?? null, firmwareVersion: existing?.firmwareVersion ?? null });
-            });
-            return next;
-          });
-          setFollowerMotors((items) => {
-            const next = new Map(items);
-            positions.forEach((position, id) => {
-              const existing = next.get(id);
-              next.set(id, { id, name: MOTOR_NAMES[id], position, voltage: existing?.voltage ?? null, firmwareVersion: existing?.firmwareVersion ?? null });
-            });
-            return next;
-          });
-        } catch (error) {
-          appendLog(`follow error: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      })();
-    }, 60);
+    ensureLeaderLoop();
   };
 
 
